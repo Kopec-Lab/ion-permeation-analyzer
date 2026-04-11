@@ -523,6 +523,100 @@ def plot_ion_positions(ion_zpos, ion_resname, trjTimes, plows, pmids, phighs,
     print('Saved: %s' % outpath)
 
 
+def find_binding_sites(bin_centers, pmf, mean_plow, mean_phigh,
+                       min_depth=0.5, min_width=1.0, margin=5.0,
+                       contour_kBT=1.0):
+    """Identify binding sites as local minima of the 1D PMF profile.
+
+    Parameters
+    ----------
+    bin_centers : 1D array
+        Z-positions of the PMF bins (Å).
+    pmf : 1D array
+        PMF values in kBT (NaN allowed).
+    mean_plow, mean_phigh : float
+        Membrane reference levels; sites are searched in
+        [plow - margin, phigh + margin].
+    min_depth : float
+        Minimum prominence of the minimum, in kBT (default 0.5).
+    min_width : float
+        Minimum width of the minimum at half-prominence, in Å (default 1).
+    margin : float
+        How far outside the headgroup region to still allow sites, in Å.
+    contour_kBT : float
+        Energy contour above the minimum used to define each site's extent
+        (default 1 kBT).
+
+    Returns
+    -------
+    list of dicts, each with keys:
+        z_min, depth_kBT, z_lo, z_hi
+    """
+    from scipy.signal import find_peaks
+
+    z_lo_search = mean_plow  - margin
+    z_hi_search = mean_phigh + margin
+
+    # Mask: only consider bins inside the search window with finite PMF
+    mask = (bin_centers >= z_lo_search) & (bin_centers <= z_hi_search) & np.isfinite(pmf)
+    if not np.any(mask):
+        return []
+
+    idx_window = np.where(mask)[0]
+    pmf_window = pmf[idx_window]
+    z_window   = bin_centers[idx_window]
+
+    # find_peaks works on maxima → invert PMF
+    bin_width = float(bin_centers[1] - bin_centers[0])
+    peaks, props = find_peaks(-pmf_window,
+                              prominence=min_depth,
+                              width=max(min_width / bin_width, 1.0))
+
+    sites = []
+    for pi in peaks:
+        z_min      = float(z_window[pi])
+        pmf_min    = float(pmf_window[pi])
+        prominence = float(props['prominences'][np.where(peaks == pi)[0][0]])
+
+        # Extent: walk left and right while PMF stays below pmf_min + contour_kBT
+        threshold = pmf_min + contour_kBT
+        lo = pi
+        while lo > 0 and pmf_window[lo - 1] <= threshold:
+            lo -= 1
+        hi = pi
+        while hi < len(pmf_window) - 1 and pmf_window[hi + 1] <= threshold:
+            hi += 1
+        sites.append({
+            'z_min':      z_min,
+            'pmf_min':    pmf_min,
+            'depth_kBT':  prominence,
+            'z_lo':       float(z_window[lo]),
+            'z_hi':       float(z_window[hi]),
+        })
+
+    sites.sort(key=lambda s: s['z_min'])
+    return sites
+
+
+def compute_site_occupancy(ion_zpos, ion_keys, mean_box_z, sites):
+    """Fraction of frames in which at least one ion of the species lies inside the site.
+
+    Also returns mean occupancy = average number of ions per frame in the site.
+    """
+    if not sites or not ion_keys:
+        return [(0.0, 0.0) for _ in sites]
+    n_frames = len(ion_zpos[ion_keys[0]])
+    z_arr = np.stack([np.array(ion_zpos[k]) % mean_box_z for k in ion_keys], axis=0)
+    results = []
+    for s in sites:
+        in_site = (z_arr >= s['z_lo']) & (z_arr <= s['z_hi'])  # (n_ions, n_frames)
+        per_frame_count = in_site.sum(axis=0)
+        frac_occupied   = float(np.mean(per_frame_count > 0))
+        mean_count      = float(np.mean(per_frame_count))
+        results.append((frac_occupied, mean_count))
+    return results
+
+
 def plot_density_pmf(ion_zpos, ion_resname, plows, pmids, phighs, mean_box_z, outbase):
     """Plot z-density profile and PMF for each ion species.
 
@@ -580,6 +674,10 @@ def plot_density_pmf(ion_zpos, ion_resname, plows, pmids, phighs, mean_box_z, ou
         with np.errstate(divide='ignore', invalid='ignore'):
             pmf = np.where(norm_smooth > 0, -np.log(norm_smooth), np.nan)
 
+        # ---- binding-site detection (local minima of the PMF) ----
+        sites = find_binding_sites(bin_centers, pmf, mean_plow, mean_phigh)
+        occ   = compute_site_occupancy(ion_zpos, ion_keys, mean_box_z, sites)
+
         # ---- plot ----
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), sharex=True,
                                         gridspec_kw={'hspace': 0.05})
@@ -610,6 +708,21 @@ def plot_density_pmf(ion_zpos, ion_resname, plows, pmids, phighs, mean_box_z, ou
                     label='pmid')
         ax2.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0,
                     label='phigh')
+        # binding-site annotations on both panels
+        for si, (s, (frac, mean_n)) in enumerate(zip(sites, occ), start=1):
+            label = 'S%d' % si
+            # shaded extent on density panel
+            ax1.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+            # marker + label on PMF panel
+            ax2.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+            ax2.plot(s['z_min'], s['pmf_min'], 'o', color='orange',
+                     markeredgecolor='black', markersize=7, zorder=5)
+            ax2.annotate('%s\n%.1f kBT\nocc %.2f' % (label, s['depth_kBT'], frac),
+                         xy=(s['z_min'], s['pmf_min']),
+                         xytext=(0, -22), textcoords='offset points',
+                         ha='center', va='top', fontsize=7,
+                         color='black')
+
         ax2.set_xlabel('Z position (Å)')
         ax2.set_ylabel('PMF (kBT)')
         ax2.legend(fontsize=8, loc='upper right')
@@ -638,6 +751,495 @@ def plot_density_pmf(ion_zpos, ion_resname, plows, pmids, phighs, mean_box_z, ou
                 fxvg.write('%10.4f  %12.6f  %12.6f  %12.6f\n' % (
                     bin_centers[j], norm_density[j], norm_smooth[j], pmf_val))
         print('Saved: %s' % xvg_path)
+
+        # ---- binding sites table ----
+        sites_path = '%s_%s_binding_sites.dat' % (outbase, resname)
+        with open(sites_path, 'w') as fs:
+            fs.write('# Binding sites for %s identified as local minima of the 1D PMF\n' % resname)
+            fs.write('# Search window: [plow - 5, phigh + 5] Å, min depth 0.5 kBT, contour 1 kBT\n')
+            fs.write('# %-4s %10s %10s %10s %12s %12s %12s\n' %
+                     ('id', 'z_min(A)', 'z_lo(A)', 'z_hi(A)', 'depth(kBT)',
+                      'occ_frac', 'mean_count'))
+            for si, (s, (frac, mean_n)) in enumerate(zip(sites, occ), start=1):
+                fs.write('  %-4d %10.3f %10.3f %10.3f %12.3f %12.4f %12.4f\n' %
+                         (si, s['z_min'], s['z_lo'], s['z_hi'],
+                          s['depth_kBT'], frac, mean_n))
+        print('Saved: %s  (%d site%s)' % (sites_path, len(sites),
+                                          '' if len(sites) == 1 else 's'))
+
+
+def plot_density_pmf_local(ion_zpos, ion_resname, plows, pmids, phighs,
+                           mean_box_z, outbase, margin=10.0):
+    """Local-mode density and PMF zoomed to the membrane region.
+
+    Complements the global plot by:
+      • Restricting the view to [plow - margin, phigh + margin].
+      • Using lighter Gaussian smoothing (σ = 1 Å) to preserve fine structure
+        inside the pore / selectivity filter.
+      • Normalising density to its local maximum within the window (not bulk).
+      • Computing a detrended PMF: the PMF from σ=1 smoothing minus a heavy
+        baseline (σ=10 Å).  The baseline captures the large-scale barrier
+        shape; subtracting it exposes local wells (binding sites) that would
+        otherwise be invisible as tiny ripples on a multi-kBT slope.
+      • Running binding-site detection on the detrended PMF with a 0.3 kBT
+        depth threshold.
+
+    Outputs per ion species:
+      <outbase>_<resname>_density_pmf_local.png   — three-panel figure
+      <outbase>_<resname>_density_pmf_local.xvg   — numerical data
+      <outbase>_<resname>_binding_sites_local.dat  — detected sites
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    resnames   = sorted(set(ion_resname.values()))
+    mean_plow  = np.mean(plows)
+    mean_pmid  = np.mean(pmids)
+    mean_phigh = np.mean(phighs)
+    bin_width  = 1.0  # Å
+    z_lo_view  = mean_plow  - margin
+    z_hi_view  = mean_phigh + margin
+
+    for resname in resnames:
+        ion_keys = [k for k, v in ion_resname.items() if v == resname]
+        n_frames = len(ion_zpos[ion_keys[0]])
+
+        # Wrap and restrict to the membrane window
+        all_z = np.concatenate([np.array(ion_zpos[k]) for k in ion_keys])
+        all_z = all_z % mean_box_z
+
+        # Histogram over the full box …
+        bins_full   = np.arange(0.0, mean_box_z + bin_width, bin_width)
+        hist, edges = np.histogram(all_z, bins=bins_full)
+        bc_full     = 0.5 * (edges[:-1] + edges[1:])
+        density_full = hist / (n_frames * bin_width)
+
+        # … then crop to the window
+        mask = (bc_full >= z_lo_view) & (bc_full <= z_hi_view)
+        bin_centers = bc_full[mask]
+        density     = density_full[mask]
+
+        # Light smoothing (σ = 1 Å) to preserve local structure
+        density_smooth = gaussian_filter1d(density.astype(float), sigma=1)
+
+        # Local normalisation to peak density in window
+        local_ref = density_smooth.max()
+        if local_ref <= 0:
+            local_ref = 1.0
+        norm_density = density        / local_ref
+        norm_smooth  = density_smooth / local_ref
+
+        # PMF (locally normalised)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pmf = np.where(norm_smooth > 0, -np.log(norm_smooth), np.nan)
+
+        # Detrended PMF: subtract a heavy baseline (σ = 10 Å) to remove the
+        # large-scale barrier shape and expose local wells.
+        pmf_for_baseline = np.where(np.isfinite(pmf), pmf, 0.0)
+        pmf_baseline = gaussian_filter1d(pmf_for_baseline, sigma=10)
+        pmf_detrended = pmf - pmf_baseline
+
+        # ---- binding-site detection on the detrended profile ----
+        # margin=0: search strictly inside [plow, phigh] to avoid spurious
+        # minima from baseline edge artefacts in bulk.
+        sites = find_binding_sites(bin_centers, pmf_detrended, mean_plow, mean_phigh,
+                                   min_depth=0.2, min_width=1.0, margin=0.0,
+                                   contour_kBT=0.2)
+        occ   = compute_site_occupancy(ion_zpos, ion_keys, mean_box_z, sites)
+
+        # ---- plot (3 panels) ----
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 10), sharex=True,
+                                             gridspec_kw={'hspace': 0.06})
+
+        # -- density panel --
+        ax1.plot(bin_centers, norm_density, color='tab:blue', linewidth=0.7,
+                 alpha=0.35, label='raw (1 Å bins)')
+        ax1.plot(bin_centers, norm_smooth,  color='tab:blue', linewidth=2.0,
+                 label='smoothed (σ = 1 Å)')
+        ax1.axvline(mean_plow,  color='steelblue', linestyle='--', linewidth=1.0,
+                    label='plow  %.1f Å' % mean_plow)
+        ax1.axvline(mean_pmid,  color='steelblue', linestyle='-',  linewidth=1.0,
+                    label='pmid  %.1f Å' % mean_pmid)
+        ax1.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0,
+                    label='phigh %.1f Å' % mean_phigh)
+        for si, (s, (frac, mean_n)) in enumerate(zip(sites, occ), start=1):
+            ax1.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+        ax1.set_ylabel('Density (normalised to local max)')
+        ax1.set_title('%s  —  local z-density and PMF (membrane region)' % resname)
+        ax1.legend(fontsize=8, loc='upper right', ncol=2)
+        ax1.grid(True, alpha=0.3)
+
+        # -- PMF panel --
+        ax2.plot(bin_centers, pmf, color='tab:red', linewidth=2.0, label='PMF (σ = 1 Å)')
+        ax2.plot(bin_centers, pmf_baseline, color='gray', linewidth=1.5,
+                 linestyle='--', label='baseline (σ = 10 Å)')
+        ax2.axhline(0.0, color='gray', linestyle=':', linewidth=0.6)
+        ax2.axvline(mean_plow,  color='steelblue', linestyle='--', linewidth=1.0)
+        ax2.axvline(mean_pmid,  color='steelblue', linestyle='-',  linewidth=1.0)
+        ax2.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0)
+        for si, (s, (frac, mean_n)) in enumerate(zip(sites, occ), start=1):
+            ax2.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+        ax2.set_ylabel('PMF (kBT, relative to local max)')
+        ax2.legend(fontsize=8, loc='upper right')
+        ax2.grid(True, alpha=0.3)
+
+        # -- detrended PMF panel --
+        ax3.plot(bin_centers, pmf_detrended, color='tab:purple', linewidth=2.0)
+        ax3.axhline(0.0, color='gray', linestyle='--', linewidth=0.8, label='baseline')
+        ax3.axvline(mean_plow,  color='steelblue', linestyle='--', linewidth=1.0,
+                    label='plow')
+        ax3.axvline(mean_pmid,  color='steelblue', linestyle='-',  linewidth=1.0,
+                    label='pmid')
+        ax3.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0,
+                    label='phigh')
+        for si, (s, (frac, mean_n)) in enumerate(zip(sites, occ), start=1):
+            slabel = 'S%d' % si
+            ax3.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+            ax3.plot(s['z_min'], s['pmf_min'], 'o', color='orange',
+                     markeredgecolor='black', markersize=7, zorder=5)
+            ax3.annotate('%s\n%.2f kBT\nocc %.2f' % (slabel, s['depth_kBT'], frac),
+                         xy=(s['z_min'], s['pmf_min']),
+                         xytext=(0, -22), textcoords='offset points',
+                         ha='center', va='top', fontsize=7,
+                         color='black')
+        ax3.set_xlabel('Z position (Å)')
+        ax3.set_ylabel('Detrended PMF (kBT)')
+        ax3.legend(fontsize=8, loc='upper right')
+        ax3.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        outpath = '%s_%s_density_pmf_local.png' % (outbase, resname)
+        plt.savefig(outpath, dpi=150)
+        plt.close(fig)
+        print('Saved: %s' % outpath)
+
+        # ---- XVG output ----
+        xvg_path = '%s_%s_density_pmf_local.xvg' % (outbase, resname)
+        with open(xvg_path, 'w') as fxvg:
+            fxvg.write('# Local density and PMF for %s (membrane region)\n' % resname)
+            fxvg.write('# Smoothing: sigma = 1 A (fine), sigma = 10 A (baseline)\n')
+            fxvg.write('# Detrended PMF = PMF - baseline\n')
+            fxvg.write('@    title "local density and PMF: %s"\n' % resname)
+            fxvg.write('@    xaxis label "Z position (A)"\n')
+            fxvg.write('@TYPE xy\n')
+            fxvg.write('@ s0 legend "density raw"\n')
+            fxvg.write('@ s1 legend "density smooth"\n')
+            fxvg.write('@ s2 legend "PMF (kBT)"\n')
+            fxvg.write('@ s3 legend "PMF baseline (kBT)"\n')
+            fxvg.write('@ s4 legend "PMF detrended (kBT)"\n')
+            for j in range(len(bin_centers)):
+                pmf_val = pmf[j] if not np.isnan(pmf[j]) else 0.0
+                det_val = pmf_detrended[j] if not np.isnan(pmf_detrended[j]) else 0.0
+                fxvg.write('%10.4f  %12.6f  %12.6f  %12.6f  %12.6f  %12.6f\n' % (
+                    bin_centers[j], norm_density[j], norm_smooth[j],
+                    pmf_val, pmf_baseline[j], det_val))
+        print('Saved: %s' % xvg_path)
+
+        # ---- binding sites table ----
+        sites_path = '%s_%s_binding_sites_local.dat' % (outbase, resname)
+        with open(sites_path, 'w') as fs:
+            fs.write('# Binding sites (detrended local PMF) for %s\n' % resname)
+            fs.write('# Membrane window: [%.1f, %.1f] Å, min depth 0.2 kBT, '
+                     'contour 0.2 kBT\n' % (z_lo_view, z_hi_view))
+            fs.write('# Fine smooth σ = 1 Å, baseline σ = 10 Å\n')
+            fs.write('# %-4s %10s %10s %10s %12s %12s %12s\n' %
+                     ('id', 'z_min(A)', 'z_lo(A)', 'z_hi(A)', 'depth(kBT)',
+                      'occ_frac', 'mean_count'))
+            for si, (s, (frac, mean_n)) in enumerate(zip(sites, occ), start=1):
+                fs.write('  %-4d %10.3f %10.3f %10.3f %12.3f %12.4f %12.4f\n' %
+                         (si, s['z_min'], s['z_lo'], s['z_hi'],
+                          s['depth_kBT'], frac, mean_n))
+        print('Saved: %s  (%d site%s)' % (sites_path, len(sites),
+                                          '' if len(sites) == 1 else 's'))
+
+
+def identify_site_residues(u, ndxCyl, sites, z_margin=2.0, r_cutoff=10.0):
+    """Find protein residues near each binding site.
+
+    For each site, selects protein atoms (from the cylinder group) whose
+    mean z-position falls within [z_lo - z_margin, z_hi + z_margin].
+    Returns a list (one per site) of sorted unique residue strings
+    like 'THR75', 'VAL76'.
+
+    Parameters
+    ----------
+    u : mda.Universe
+        The MDAnalysis Universe (positioned at any frame — uses current
+        positions as a representative snapshot).
+    ndxCyl : array
+        0-based atom indices for the cylinder/protein group.
+    sites : list of dicts
+        Binding sites with 'z_lo' and 'z_hi' keys.
+    z_margin : float
+        Extra Å above/below the site extent to search (default 2).
+    r_cutoff : float
+        Maximum xy-distance (Å) from the protein group centroid to include
+        an atom (default 10). Filters out lipid-facing residues in large
+        protein complexes.
+    """
+    if not sites or len(ndxCyl) == 0:
+        return [[] for _ in sites]
+
+    positions = u.atoms.positions
+    prot_pos = positions[ndxCyl]
+    # Cylinder center in xy
+    cx = np.mean(prot_pos[:, 0])
+    cy = np.mean(prot_pos[:, 1])
+
+    results = []
+    for s in sites:
+        z_lo = s['z_lo'] - z_margin
+        z_hi = s['z_hi'] + z_margin
+        residues = set()
+        for i, idx in enumerate(ndxCyl):
+            az = prot_pos[i, 2]
+            if az < z_lo or az > z_hi:
+                continue
+            # xy distance from pore center
+            dx = prot_pos[i, 0] - cx
+            dy = prot_pos[i, 1] - cy
+            if np.sqrt(dx*dx + dy*dy) > r_cutoff:
+                continue
+            atom = u.atoms[int(idx)]
+            residues.add((atom.resname, atom.resid))
+        # Sort by resid, format as "RESNAME RESID"
+        sorted_res = sorted(residues, key=lambda x: x[1])
+        results.append(['%s%d' % (rn, ri) for rn, ri in sorted_res])
+    return results
+
+
+def write_binding_sites_pdb(u, ndxCyl, sites, outpath):
+    """Write a PDB file with the protein and dummy atoms at binding-site centers.
+
+    The protein atoms are taken from the cylinder group (current Universe
+    frame).  For each binding site, a dummy atom (element X, residue name
+    DUM, chain Z) is placed at (pore_center_x, pore_center_y, z_min) so
+    the sites can be visualised in VMD / PyMOL / ChimeraX overlaid on the
+    protein structure.
+    """
+    positions = u.atoms.positions
+    prot_pos = positions[ndxCyl]
+    cx = np.mean(prot_pos[:, 0])
+    cy = np.mean(prot_pos[:, 1])
+
+    with open(outpath, 'w') as fp:
+        fp.write('REMARK  Binding sites visualisation\n')
+        fp.write('REMARK  Protein atoms from cylinder group + DUM atoms at site centers\n')
+
+        serial = 1
+        # Write protein atoms
+        for i, idx in enumerate(ndxCyl):
+            atom = u.atoms[int(idx)]
+            x, y, z = prot_pos[i]
+            aname = atom.name[:4].ljust(4)
+            resname = atom.resname[:3].rjust(3)
+            chain = atom.chainID if hasattr(atom, 'chainID') and atom.chainID else 'A'
+            chain = chain[0] if len(chain) > 0 else 'A'
+            resid = atom.resid % 10000  # PDB resid field is 4 digits
+            fp.write('ATOM  %5d %-4s %3s %1s%4d    %8.3f%8.3f%8.3f  1.00  0.00\n' %
+                     (serial % 100000, aname, resname, chain, resid, x, y, z))
+            serial += 1
+
+        fp.write('TER\n')
+
+        # Write dummy atoms at binding-site centers
+        for si, s in enumerate(sites, start=1):
+            resid = si
+            fp.write('HETATM%5d %-4s %3s %1s%4d    %8.3f%8.3f%8.3f  1.00%6.2f\n' %
+                     (serial % 100000, 'DU', 'DUM', 'Z', resid,
+                      cx, cy, s['z_min'], s['depth_kBT']))
+            serial += 1
+
+        fp.write('END\n')
+    print('Saved: %s  (%d dummy atoms for binding sites)' % (outpath, len(sites)))
+
+
+def plot_density_pmf_pore(ion_zpos, ionsCyl, ion_resname, plows, pmids, phighs,
+                          mean_box_z, outbase, u=None, ndxCyl=None, margin=5.0):
+    """Pore-only density and PMF using only ion positions inside the cylinder.
+
+    When -cyl is used, ionsCyl stores 0/1 per frame per ion indicating whether
+    the ion was inside the pore cylinder.  By restricting the histogram to
+    those positions, bulk ions are excluded and the fine structure of the
+    selectivity filter (binding sites) becomes clearly resolved.
+
+    Uses 0.5 Å bins, σ = 0.5 Å smoothing, and no detrending — because bulk
+    ions are excluded, the PMF directly reflects the pore landscape without
+    needing baseline subtraction.
+
+    Outputs per ion species:
+      <outbase>_<resname>_density_pmf_pore.png
+      <outbase>_<resname>_density_pmf_pore.xvg
+      <outbase>_<resname>_binding_sites_pore.dat
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    resnames   = sorted(set(ion_resname.values()))
+    mean_plow  = np.mean(plows)
+    mean_pmid  = np.mean(pmids)
+    mean_phigh = np.mean(phighs)
+    bin_width  = 0.5  # Å — fine bins for resolving ~3.5 Å-spaced sites
+    z_lo_view  = mean_plow  - margin
+    z_hi_view  = mean_phigh + margin
+
+    for resname in resnames:
+        ion_keys = [k for k, v in ion_resname.items() if v == resname]
+
+        # Collect only z-positions where the ion was inside the cylinder
+        pore_z = []
+        for k in ion_keys:
+            zs = np.array(ion_zpos[k])
+            cyl = np.array(ionsCyl[k])
+            pore_z.append(zs[cyl == 1])
+        all_z = np.concatenate(pore_z)
+        all_z = all_z % mean_box_z
+
+        if len(all_z) == 0:
+            print('No in-cylinder data for %s — skipping pore PMF' % resname)
+            continue
+
+        n_frames = len(ion_zpos[ion_keys[0]])
+
+        # Histogram restricted to the membrane window
+        bins = np.arange(z_lo_view, z_hi_view + bin_width, bin_width)
+        hist, edges = np.histogram(all_z, bins=bins)
+        bin_centers = 0.5 * (edges[:-1] + edges[1:])
+
+        density = hist / (n_frames * bin_width)
+        density_smooth = gaussian_filter1d(density.astype(float), sigma=1)  # σ = 0.5 Å in bins
+
+        # PMF = -ln(density) + const, shifted so minimum = 0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pmf = np.where(density_smooth > 0, -np.log(density_smooth), np.nan)
+        pmf -= np.nanmin(pmf)
+
+        # Detrended PMF: subtract a heavy baseline (σ = 5 Å = 10 bins) to
+        # remove the large-scale slope from vestibule→filter and expose
+        # individual binding sites.
+        pmf_for_baseline = np.where(np.isfinite(pmf), pmf, 0.0)
+        pmf_baseline = gaussian_filter1d(pmf_for_baseline, sigma=10)  # σ=5 Å
+        pmf_detrended = pmf - pmf_baseline
+
+        # ---- binding-site detection on detrended profile ----
+        sites = find_binding_sites(bin_centers, pmf_detrended, mean_plow, mean_phigh,
+                                   min_depth=0.1, min_width=0.5, margin=2.0,
+                                   contour_kBT=0.15)
+        occ = compute_site_occupancy(ion_zpos, ion_keys, mean_box_z, sites)
+        if u is not None and ndxCyl is not None:
+            site_residues = identify_site_residues(u, ndxCyl, sites)
+        else:
+            site_residues = [[] for _ in sites]
+
+        # ---- plot (3 panels) ----
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 10), sharex=True,
+                                             gridspec_kw={'hspace': 0.06})
+
+        ax1.bar(bin_centers, hist, width=bin_width, color='tab:blue', alpha=0.3,
+                label='raw (0.5 Å bins)')
+        ax1.plot(bin_centers, density_smooth * n_frames * bin_width,
+                 color='tab:blue', linewidth=2, label='smoothed (σ = 0.5 Å)')
+        ax1.axvline(mean_plow,  color='steelblue', linestyle='--', linewidth=1.0,
+                    label='plow  %.1f Å' % mean_plow)
+        ax1.axvline(mean_pmid,  color='steelblue', linestyle='-',  linewidth=1.0,
+                    label='pmid  %.1f Å' % mean_pmid)
+        ax1.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0,
+                    label='phigh %.1f Å' % mean_phigh)
+        for si, (s, _) in enumerate(zip(sites, occ), start=1):
+            ax1.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+        ax1.set_ylabel('Count (in-cylinder ions)')
+        ax1.set_title('%s  —  pore density and PMF (cylinder-filtered)' % resname)
+        ax1.legend(fontsize=8, loc='upper right', ncol=2)
+        ax1.grid(True, alpha=0.3)
+
+        ax2.plot(bin_centers, pmf, color='tab:red', linewidth=2.0, label='PMF')
+        ax2.plot(bin_centers, pmf_baseline, color='gray', linewidth=1.5,
+                 linestyle='--', label='baseline (σ = 5 Å)')
+        ax2.axhline(0.0, color='gray', linestyle=':', linewidth=0.6)
+        ax2.axvline(mean_plow,  color='steelblue', linestyle='--', linewidth=1.0)
+        ax2.axvline(mean_pmid,  color='steelblue', linestyle='-',  linewidth=1.0)
+        ax2.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0)
+        for si, (s, _) in enumerate(zip(sites, occ), start=1):
+            ax2.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+        ax2.set_ylabel('PMF (kBT)')
+        ax2.legend(fontsize=8, loc='upper right')
+        ax2.grid(True, alpha=0.3)
+
+        ax3.plot(bin_centers, pmf_detrended, color='tab:purple', linewidth=2.0)
+        ax3.axhline(0.0, color='gray', linestyle='--', linewidth=0.8)
+        ax3.axvline(mean_plow,  color='steelblue', linestyle='--', linewidth=1.0)
+        ax3.axvline(mean_pmid,  color='steelblue', linestyle='-',  linewidth=1.0)
+        ax3.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0)
+        for si, (s, (frac, mean_n), reslist) in enumerate(
+                zip(sites, occ, site_residues), start=1):
+            slabel = 'S%d' % si
+            ax3.axvspan(s['z_lo'], s['z_hi'], color='orange', alpha=0.15)
+            ax3.plot(s['z_min'], s['pmf_min'], 'o', color='orange',
+                     markeredgecolor='black', markersize=7, zorder=5)
+            # Build annotation: site label + depth + occupancy + residues
+            ann_text = '%s\n%.2f kBT\nocc %.2f' % (slabel, s['depth_kBT'], frac)
+            if reslist:
+                # Show up to 6 residues in annotation; full list in .dat file
+                res_str = ', '.join(reslist[:6])
+                if len(reslist) > 6:
+                    res_str += ', ...'
+                ann_text += '\n' + res_str
+            ax3.annotate(ann_text,
+                         xy=(s['z_min'], s['pmf_min']),
+                         xytext=(0, -18), textcoords='offset points',
+                         ha='center', va='top', fontsize=6,
+                         color='black')
+        ax3.set_xlabel('Z position (Å)')
+        ax3.set_ylabel('Detrended PMF (kBT)')
+        ax3.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        outpath = '%s_%s_density_pmf_pore.png' % (outbase, resname)
+        plt.savefig(outpath, dpi=150)
+        plt.close(fig)
+        print('Saved: %s' % outpath)
+
+        # ---- XVG output ----
+        xvg_path = '%s_%s_density_pmf_pore.xvg' % (outbase, resname)
+        with open(xvg_path, 'w') as fxvg:
+            fxvg.write('# Pore density and PMF for %s (cylinder-filtered)\n' % resname)
+            fxvg.write('# Only positions where ion was inside the cylinder\n')
+            fxvg.write('# Bin width = 0.5 A, smoothing sigma = 0.5 A\n')
+            fxvg.write('@    title "pore density and PMF: %s"\n' % resname)
+            fxvg.write('@    xaxis label "Z position (A)"\n')
+            fxvg.write('@TYPE xy\n')
+            fxvg.write('@ s0 legend "count raw"\n')
+            fxvg.write('@ s1 legend "density smooth"\n')
+            fxvg.write('@ s2 legend "PMF (kBT)"\n')
+            fxvg.write('@ s3 legend "PMF baseline (kBT)"\n')
+            fxvg.write('@ s4 legend "PMF detrended (kBT)"\n')
+            for j in range(len(bin_centers)):
+                pmf_val = pmf[j] if not np.isnan(pmf[j]) else 0.0
+                det_val = pmf_detrended[j] if not np.isnan(pmf_detrended[j]) else 0.0
+                fxvg.write('%10.4f  %12.0f  %12.6f  %12.6f  %12.6f  %12.6f\n' % (
+                    bin_centers[j], hist[j], density_smooth[j],
+                    pmf_val, pmf_baseline[j], det_val))
+        print('Saved: %s' % xvg_path)
+
+        # ---- binding sites table ----
+        sites_path = '%s_%s_binding_sites_pore.dat' % (outbase, resname)
+        with open(sites_path, 'w') as fs:
+            fs.write('# Binding sites (pore PMF) for %s\n' % resname)
+            fs.write('# Cylinder-filtered, 0.5 Å bins, σ = 0.5 Å\n')
+            fs.write('# %-4s %10s %10s %10s %12s %12s %12s  %s\n' %
+                     ('id', 'z_min(A)', 'z_lo(A)', 'z_hi(A)', 'depth(kBT)',
+                      'occ_frac', 'mean_count', 'nearby_residues'))
+            for si, (s, (frac, mean_n), reslist) in enumerate(
+                    zip(sites, occ, site_residues), start=1):
+                res_str = ', '.join(reslist) if reslist else '-'
+                fs.write('  %-4d %10.3f %10.3f %10.3f %12.3f %12.4f %12.4f  %s\n' %
+                         (si, s['z_min'], s['z_lo'], s['z_hi'],
+                          s['depth_kBT'], frac, mean_n, res_str))
+        print('Saved: %s  (%d site%s)' % (sites_path, len(sites),
+                                          '' if len(sites) == 1 else 's'))
+
+        # ---- PDB with protein + dummy atoms at binding sites ----
+        if u is not None and ndxCyl is not None and sites:
+            pdb_path = '%s_%s_binding_sites_pore.pdb' % (outbase, resname)
+            write_binding_sites_pdb(u, ndxCyl, sites, pdb_path)
 
 
 def plot_density_pmf_2d(ion_xpos, ion_ypos, ion_zpos, ion_resname,
@@ -986,6 +1588,10 @@ def main(argv):
     plot_ion_positions(ion_zpos, ion_resname, trjTimes, plows, pmids, phighs,
                        transitionsUpTimes, transitionsDownTimes, outbase)
     plot_density_pmf(ion_zpos, ion_resname, plows, pmids, phighs, mean_box_z, outbase)
+    plot_density_pmf_local(ion_zpos, ion_resname, plows, pmids, phighs, mean_box_z, outbase)
+    if bCyl:
+        plot_density_pmf_pore(ion_zpos, ionsCyl, ion_resname, plows, pmids, phighs,
+                              mean_box_z, outbase, u=u, ndxCyl=ndxCyl)
     plot_density_pmf_2d(ion_xpos, ion_ypos, ion_zpos, ion_resname,
                         mean_box_x, mean_box_y, mean_box_z,
                         plows, phighs, outbase)
