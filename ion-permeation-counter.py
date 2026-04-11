@@ -1349,6 +1349,208 @@ def plot_density_pmf_2d(ion_xpos, ion_ypos, ion_zpos, ion_resname,
             print('Saved: %s' % dat_path)
 
 
+def compute_coordination(u, permeating_keys, ion_resname, ndxCyl=None,
+                          cutoff=3.5):
+    """Second trajectory pass: compute coordination numbers for permeating ions.
+
+    For each permeating ion and each frame, counts the number of water
+    oxygens (name OW) and protein heavy atoms within `cutoff` Å.
+
+    Parameters
+    ----------
+    u : mda.Universe
+    permeating_keys : set of int
+        0-based atom indices of ions that permeated at least once.
+    ion_resname : dict
+        Mapping ion index → residue name.
+    ndxCyl : array or None
+        Protein group indices (for protein coordination). If None, only
+        water coordination is computed.
+    cutoff : float
+        First coordination shell cutoff in Å (default 3.5).
+
+    Returns
+    -------
+    coord_data : dict
+        {ion_idx: {'z': [...], 'n_water': [...], 'n_prot': [...]}}
+    """
+    from MDAnalysis.lib.distances import distance_array
+
+    water_ox = u.select_atoms('name OW')
+    if len(water_ox) == 0:
+        # Try alternative water oxygen names
+        water_ox = u.select_atoms('name OH2 or name O and resname HOH WAT TIP3')
+    n_water_atoms = len(water_ox)
+
+    if ndxCyl is not None and len(ndxCyl) > 0:
+        prot_ag = u.atoms[ndxCyl]
+        # Heavy atoms only (mass > 2 excludes H regardless of naming)
+        prot_heavy = prot_ag.select_atoms('not name H*')
+        if len(prot_heavy) == 0:
+            prot_heavy = prot_ag.atoms[[i for i in range(len(prot_ag))
+                                        if prot_ag[i].mass > 2.0]]
+        n_prot_atoms = len(prot_heavy)
+    else:
+        prot_heavy = None
+        n_prot_atoms = 0
+
+    print('Coordination analysis: %d permeating ions, %d water O, %d protein heavy atoms, cutoff %.1f Å'
+          % (len(permeating_keys), n_water_atoms, n_prot_atoms, cutoff))
+
+    perm_list = sorted(permeating_keys)
+    coord_data = {k: {'z': [], 'n_water': [], 'n_prot': []} for k in perm_list}
+
+    n_frames = len(u.trajectory)
+    for fi, ts in enumerate(u.trajectory):
+        if fi % 500 == 0:
+            sys.stdout.write('Coordination: frame %d / %d\r' % (fi, n_frames))
+            sys.stdout.flush()
+
+        box = ts.dimensions
+        positions = u.atoms.positions
+        wat_pos = water_ox.positions
+        prot_pos = prot_heavy.positions if prot_heavy is not None else None
+
+        for key in perm_list:
+            ion_pos = positions[key].reshape(1, 3)
+            z = positions[key][2]
+
+            # Water coordination
+            dists_w = distance_array(ion_pos, wat_pos, box=box)[0]
+            n_w = int(np.sum(dists_w <= cutoff))
+
+            # Protein coordination
+            if prot_pos is not None:
+                dists_p = distance_array(ion_pos, prot_pos, box=box)[0]
+                n_p = int(np.sum(dists_p <= cutoff))
+            else:
+                n_p = 0
+
+            coord_data[key]['z'].append(z)
+            coord_data[key]['n_water'].append(n_w)
+            coord_data[key]['n_prot'].append(n_p)
+
+    sys.stdout.write('Coordination: done (%d frames)          \n' % n_frames)
+    return coord_data
+
+
+def plot_coordination(coord_data, ion_resname, plows, pmids, phighs,
+                      mean_box_z, outbase, bin_width=1.0):
+    """Plot average coordination number vs z-position for permeating ions.
+
+    Three curves: water coordination, protein coordination, total.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    mean_plow  = np.mean(plows)
+    mean_pmid  = np.mean(pmids)
+    mean_phigh = np.mean(phighs)
+
+    resnames = sorted(set(ion_resname[k] for k in coord_data))
+
+    for resname in resnames:
+        keys = [k for k in coord_data if ion_resname[k] == resname]
+        if not keys:
+            continue
+
+        # Pool all (z, n_water, n_prot) data from all permeating ions
+        all_z = []
+        all_nw = []
+        all_np = []
+        for k in keys:
+            all_z.extend(coord_data[k]['z'])
+            all_nw.extend(coord_data[k]['n_water'])
+            all_np.extend(coord_data[k]['n_prot'])
+        all_z  = np.array(all_z) % mean_box_z
+        all_nw = np.array(all_nw, dtype=float)
+        all_np = np.array(all_np, dtype=float)
+        all_nt = all_nw + all_np
+
+        # Bin by z and compute mean in each bin
+        bins = np.arange(0.0, mean_box_z + bin_width, bin_width)
+        bin_centers = 0.5 * (bins[:-1] + bins[1:])
+        bin_idx = np.digitize(all_z, bins) - 1
+        n_bins = len(bin_centers)
+
+        mean_nw = np.full(n_bins, np.nan)
+        mean_np = np.full(n_bins, np.nan)
+        mean_nt = np.full(n_bins, np.nan)
+        for bi in range(n_bins):
+            mask = bin_idx == bi
+            if np.sum(mask) > 0:
+                mean_nw[bi] = np.mean(all_nw[mask])
+                mean_np[bi] = np.mean(all_np[mask])
+                mean_nt[bi] = np.mean(all_nt[mask])
+
+        # Light smoothing
+        valid = np.isfinite(mean_nw)
+        nw_smooth = np.full(n_bins, np.nan)
+        np_smooth = np.full(n_bins, np.nan)
+        nt_smooth = np.full(n_bins, np.nan)
+        if np.sum(valid) > 3:
+            nw_smooth[valid] = gaussian_filter1d(mean_nw[valid], sigma=1)
+            np_smooth[valid] = gaussian_filter1d(mean_np[valid], sigma=1)
+            nt_smooth[valid] = gaussian_filter1d(mean_nt[valid], sigma=1)
+
+        # ---- plot ----
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(bin_centers, nw_smooth, color='tab:blue', linewidth=2.0,
+                label='Water O')
+        ax.plot(bin_centers, np_smooth, color='tab:orange', linewidth=2.0,
+                label='Protein')
+        ax.plot(bin_centers, nt_smooth, color='black', linewidth=2.0,
+                linestyle='--', label='Total')
+        # Raw data as faint lines
+        ax.plot(bin_centers, mean_nw, color='tab:blue', linewidth=0.5, alpha=0.3)
+        ax.plot(bin_centers, mean_np, color='tab:orange', linewidth=0.5, alpha=0.3)
+
+        ax.axvline(mean_plow,  color='steelblue', linestyle='--', linewidth=1.0,
+                   label='plow  %.1f Å' % mean_plow)
+        ax.axvline(mean_pmid,  color='steelblue', linestyle='-',  linewidth=1.0,
+                   label='pmid  %.1f Å' % mean_pmid)
+        ax.axvline(mean_phigh, color='steelblue', linestyle=':',  linewidth=1.0,
+                   label='phigh %.1f Å' % mean_phigh)
+
+        ax.set_xlabel('Z position (Å)')
+        ax.set_ylabel('Coordination number')
+        ax.set_title('%s  —  coordination of permeating ions (n=%d)' % (resname, len(keys)))
+        ax.legend(fontsize=8, loc='upper right')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(mean_plow - 15, mean_phigh + 15)
+
+        plt.tight_layout()
+        outpath = '%s_%s_coordination.png' % (outbase, resname)
+        plt.savefig(outpath, dpi=150)
+        plt.close(fig)
+        print('Saved: %s' % outpath)
+
+        # ---- XVG output ----
+        xvg_path = '%s_%s_coordination.xvg' % (outbase, resname)
+        with open(xvg_path, 'w') as fxvg:
+            fxvg.write('# Coordination numbers for permeating %s ions\n' % resname)
+            fxvg.write('# Averaged over %d permeating ions\n' % len(keys))
+            fxvg.write('@    title "Coordination: %s"\n' % resname)
+            fxvg.write('@    xaxis label "Z position (A)"\n')
+            fxvg.write('@    yaxis label "Coordination number"\n')
+            fxvg.write('@TYPE xy\n')
+            fxvg.write('@ s0 legend "water O (raw)"\n')
+            fxvg.write('@ s1 legend "protein (raw)"\n')
+            fxvg.write('@ s2 legend "total (raw)"\n')
+            fxvg.write('@ s3 legend "water O (smooth)"\n')
+            fxvg.write('@ s4 legend "protein (smooth)"\n')
+            fxvg.write('@ s5 legend "total (smooth)"\n')
+            for j in range(n_bins):
+                nw_r = mean_nw[j] if np.isfinite(mean_nw[j]) else 0.0
+                np_r = mean_np[j] if np.isfinite(mean_np[j]) else 0.0
+                nt_r = mean_nt[j] if np.isfinite(mean_nt[j]) else 0.0
+                nw_s = nw_smooth[j] if np.isfinite(nw_smooth[j]) else 0.0
+                np_s = np_smooth[j] if np.isfinite(np_smooth[j]) else 0.0
+                nt_s = nt_smooth[j] if np.isfinite(nt_smooth[j]) else 0.0
+                fxvg.write('%10.4f  %8.4f  %8.4f  %8.4f  %8.4f  %8.4f  %8.4f\n' %
+                           (bin_centers[j], nw_r, np_r, nt_r, nw_s, np_s, nt_s))
+        print('Saved: %s' % xvg_path)
+
+
 def main(argv):
 
     ################################
@@ -1390,6 +1592,8 @@ def main(argv):
                         help='Output counts file')
     parser.add_argument('-cyl', action='store_true',
                         help='Count ions passing through a cylinder defined by a protein group')
+    parser.add_argument('-coord', action='store_true',
+                        help='Compute coordination numbers for permeating ions (second trajectory pass, slow)')
 
     args = parser.parse_args(argv[1:])
 
@@ -1398,6 +1602,7 @@ def main(argv):
     ndxFile = args.n
     predFile = args.o
     bCyl = args.cyl
+    bCoord = args.coord
 
     # Load structure and trajectory with MDAnalysis
     u = mda.Universe(strFile, trjFile)
@@ -1595,6 +1800,23 @@ def main(argv):
     plot_density_pmf_2d(ion_xpos, ion_ypos, ion_zpos, ion_resname,
                         mean_box_x, mean_box_y, mean_box_z,
                         plows, phighs, outbase)
+
+    # ---- coordination analysis for permeating ions (optional, slow) ----
+    if bCoord:
+        permeating = set()
+        for key, times in transitionsUpTimes.items():
+            if times:
+                permeating.add(key)
+        for key, times in transitionsDownTimes.items():
+            if times:
+                permeating.add(key)
+        if permeating:
+            coord_data = compute_coordination(u, permeating, ion_resname,
+                                              ndxCyl=ndxCyl if bCyl else None)
+            plot_coordination(coord_data, ion_resname, plows, pmids, phighs,
+                              mean_box_z, outbase)
+        else:
+            print('No permeating ions — skipping coordination analysis')
 
 
 if __name__ == '__main__':
