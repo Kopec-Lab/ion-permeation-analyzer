@@ -64,7 +64,7 @@ pip install MDAnalysis numpy scipy matplotlib
 ## Usage
 
 ```bash
-python ion-permeation-counter.py -s <structure> -f <trajectory> -n <index> -o <output> [-cyl]
+python ion-permeation-counter.py -s <structure> -f <trajectory> -n <index> -o <output> [-cyl] [-coord]
 ```
 
 | Argument | Description |
@@ -74,6 +74,7 @@ python ion-permeation-counter.py -s <structure> -f <trajectory> -n <index> -o <o
 | `-n`     | GROMACS index file (`.ndx`) — default `index.ndx` |
 | `-o`     | Output base name for the `.dat` summary and all plots — default `out.dat` |
 | `-cyl`   | Enable cylinder-restricted counting and pore PMF (asks for an extra index group) |
+| `-coord` | Compute coordination analysis for permeating ions (slow — requires second trajectory pass) |
 
 The script is **interactive**: it prints the groups found in the index file
 and asks you (by number) to pick:
@@ -328,6 +329,39 @@ useful for wider channels where lateral structure matters.
   `H_center  Z_center  rho_raw  rho_smooth  PMF`,
   blank lines between H rows for compatibility with gnuplot's `splot`.
 
+### Coordination analysis (requires `-coord`)
+
+#### `<base>_<resname>_coordination.png` / `.xvg`
+Per-ion coordination number vs z-position for all permeating ions, averaged
+and plotted as three curves:
+
+- **Water coordination** — number of water oxygen atoms within the first
+  coordination shell (default cutoff: 3.5 A).
+- **Protein coordination** — number of protein heavy atoms within the same
+  cutoff. Only computed when `-cyl` is also used (protein group required);
+  otherwise this curve is zero.
+- **Total coordination** — sum of water + protein.
+
+This reveals how the solvation shell changes during permeation: whether ions
+cross the membrane fully hydrated, partially desolvated, or with water
+replaced by protein contacts (e.g. carbonyl oxygens in a K+ channel
+selectivity filter).
+
+The analysis requires a **second pass** through the entire trajectory, which
+can be slow for long simulations. It is therefore gated behind the `-coord`
+flag and not run by default.
+
+- The `.xvg` file contains columns `z  water_coord  protein_coord  total_coord`.
+- The plot shows the three coordination curves with membrane reference lines
+  (`plow`, `pmid`, `phigh`) overlaid.
+
+> **Note — planned development:** The coordination analysis is functional but
+> will be extended in future versions. Planned improvements include:
+> configurable cutoff radius, detection of coordinating atom types and their
+> physicochemical properties (e.g. distinguishing backbone carbonyls from
+> side-chain hydroxyls), and per-site coordination breakdown aligned with
+> the detected binding sites.
+
 ## Example
 
 ### Basic run (no cylinder)
@@ -368,4 +402,17 @@ Additional output:
 out_POT_density_pmf_pore.png / .xvg    # pore-only density + PMF
 out_POT_binding_sites_pore.dat          # binding sites (pore, finest resolution)
 out_POT_binding_sites_pore.pdb          # protein + dummy atoms at site centers
+```
+
+### With coordination analysis
+
+```bash
+python ion-permeation-counter.py \
+    -s channel.pdb -f channel.xtc -n index.ndx -o out.dat -cyl -coord
+# select phosphate group, ion group, then protein group
+```
+
+Additional output:
+```
+out_POT_coordination.png / .xvg        # coordination number vs z for permeating ions
 ```
