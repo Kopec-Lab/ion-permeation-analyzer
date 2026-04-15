@@ -329,6 +329,38 @@ useful for wider channels where lateral structure matters.
   `H_center  Z_center  rho_raw  rho_smooth  PMF`,
   blank lines between H rows for compatibility with gnuplot's `splot`.
 
+### Pore occupancy and ion-ion distances (requires `-cyl`)
+
+#### `<base>_<resname>_pore_occupancy.png` / `.dat`
+Number of ions inside the pore (cylinder AND membrane z-range `[plow, phigh]`)
+at each frame. Two panels:
+
+- **Left** — occupancy time series with a running average overlaid.
+- **Right** — histogram of occupancy states (fraction of frames with 0, 1,
+  2, ... ions in the pore), with the mean occupancy marked.
+
+This immediately reveals the dominant occupancy state of the pore. For
+example, a K+ channel selectivity filter typically has 2-3 K+ ions at all
+times (plus additional ions in the vestibules within the cylinder), while a
+narrow single-ion channel would show predominantly 0-1 ions.
+
+The `.dat` file contains a header with the occupancy distribution and mean,
+followed by per-frame columns `time_ns  n_ions`.
+
+#### `<base>_<resname>_ion_ion_distances.png` / `.dat`
+Histogram of all pairwise distances between ions simultaneously inside the
+pore. Only frames with >= 2 ions contribute.
+
+- Sharp peaks at short distances (e.g. ~3.5 A and ~7 A) indicate ions
+  occupying adjacent and next-nearest binding sites — the signature of
+  multi-ion knock-on permeation as seen in K+ channel selectivity filters.
+- A smooth, broad distribution peaking at large distances indicates ions
+  permeate largely independently of each other.
+
+The `.dat` file contains a header with summary statistics (total pairs,
+median, mean), followed by the histogram as columns
+`bin_center_A  count  probability_density`.
+
 ### Coordination analysis (requires `-coord`)
 
 #### `<base>_<resname>_coordination.png` / `.xvg`
@@ -402,6 +434,8 @@ Additional output:
 out_POT_density_pmf_pore.png / .xvg    # pore-only density + PMF
 out_POT_binding_sites_pore.dat          # binding sites (pore, finest resolution)
 out_POT_binding_sites_pore.pdb          # protein + dummy atoms at site centers
+out_POT_pore_occupancy.png / .dat      # pore ion occupancy vs time + histogram
+out_POT_ion_ion_distances.png / .dat   # pairwise ion-ion distance histogram
 ```
 
 ### With coordination analysis

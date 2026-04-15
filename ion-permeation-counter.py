@@ -1,11 +1,11 @@
 
 __doc__ = """
-count-ions-mdanalysis.py  —  Ion permeation counter for GROMACS MD trajectories
+ion-permeation-counter.py  —  Ion permeation counter for GROMACS MD trajectories
 =================================================================================
 
 Usage
 -----
-    python count-ions-mdanalysis.py -s <structure> -f <trajectory> -n <index> -o <output> [-cyl]
+    python ion-permeation-counter.py -s <structure> -f <trajectory> -n <index> -o <output> [-cyl] [-coord]
 
 Required arguments
 ------------------
@@ -27,6 +27,8 @@ Optional arguments
     -cyl        Enable cylinder-restricted counting.  Ions must pass through a
                 cylinder (defined by a protein/pore group) to be counted as
                 permeation events.  The cylinder axis is parallel to z.
+    -coord      Compute coordination numbers (water + protein) for permeating
+                ions vs z-position.  Requires a second trajectory pass (slow).
 
 How it works
 ------------
@@ -119,7 +121,7 @@ Dependencies
 
 Example
 -------
-    python count-ions-mdanalysis.py -s md.gro -f md.xtc -n index.ndx -o results/ions.dat
+    python ion-permeation-counter.py -s md.gro -f md.xtc -n index.ndx -o results/ions.dat
 """
 
 import sys
@@ -132,17 +134,15 @@ import matplotlib.pyplot as plt
 import MDAnalysis as mda
 
 
-mainchain = ['N', 'NH', 'C', 'O', 'CA', 'OC1', 'OC2', 'OX', 'H', 'HA', 'HA1', 'HA2']
-bckb = ['N', 'C', 'CA', 'NH']
-
-
-def track_permeations(ions, trjTimes, bCyl=False, ionsCyl={}):
+def track_permeations(ions, trjTimes, bCyl=False, ionsCyl=None):
+    if ionsCyl is None:
+        ionsCyl = {}
     transitionsUp = {}
     transitionsDown = {}
     transitionsUpTimes = {}
     transitionsDownTimes = {}
-    transitionsUpTransit = {}    # transit times (ps) for each upward permeation
-    transitionsDownTransit = {}  # transit times (ps) for each downward permeation
+    transitionsUpTransit = {}    # transit times (ns) for each upward permeation
+    transitionsDownTransit = {}  # transit times (ns) for each downward permeation
     totalUp = 0
     totalDown = 0
     # counting within cylinder (optional)
@@ -206,7 +206,7 @@ def track_permeations(ions, trjTimes, bCyl=False, ionsCyl={}):
                 print('WARNING: large ion jump, your trj output frequency is too low')
                 state0 = 0
             ######## cylinder #######
-            if bCyl == True:
+            if bCyl:
                 if state0 == 2:
                     if ionsCyl[key][counter] == 1:
                         CYLstate0 = 1
@@ -239,16 +239,8 @@ def track_permeations(ions, trjTimes, bCyl=False, ionsCyl={}):
             elif state1 == 1 and i == 3:
                 print('WARNING: large ion jump, your trj output frequency is too low')
                 state1 = 3
-
-            # WARNING: jump over two positions
-            elif (state1 == 2 and i == 4) or \
-                 (state1 == 4 and i == 2) or \
-                 (state1 == 3 and i == 1) or \
-                 (state1 == 1 and i == 3):
-                print('WARNING: large ion jump, your trj output frequency is too low')
-                state1 = 5
             ######## cylinder #######
-            if bCyl == True:
+            if bCyl:
                 if state1 == 3:
                     if ionsCyl[key][counter] == 1:
                         CYLstate1 = 1
@@ -297,45 +289,26 @@ def track_permeations(ions, trjTimes, bCyl=False, ionsCyl={}):
 
 
 def identify_range(z, plow, pmid, phigh):
-    r = 0
     if z < plow:
-        r = 1
-    elif z >= plow and z < pmid:
-        r = 2
-    elif z >= pmid and z < phigh:
-        r = 3
-    elif z >= phigh:
-        r = 4
-    return r
-
-
-def identify_if_in_cylinder(x, y, cylCenter, cylRad):
-    d = np.sqrt(np.power(x - cylCenter[0], 2.0) + np.power(y - cylCenter[1], 2.0))
-    if d <= cylRad:
         return 1
-    return 0
+    elif z < pmid:
+        return 2
+    elif z < phigh:
+        return 3
+    else:
+        return 4
+
+
+def identify_if_in_cylinder(x, y, cylCenter, cylRadSq):
+    """Check if (x,y) is within the cylinder. cylRadSq is radius squared."""
+    d2 = (x - cylCenter[0]) ** 2 + (y - cylCenter[1]) ** 2
+    return 1 if d2 <= cylRadSq else 0
 
 
 def get_cylinder(crd):
-    # return the [x,y] coordinates of the center point and radius
-    center = [0.0, 0.0]
-    rad = 0.0
-
-    # 1. get the center
-    count = 0
-    for c in crd:
-        center[0] += c[0]
-        center[1] += c[1]
-        count += 1
-    center[0] /= float(count)
-    center[1] /= float(count)
-
-    # 2. get the radius (as a maximal distance from the center)
-    for c in crd:
-        d = np.sqrt(np.power(c[0] - center[0], 2.0) + np.power(c[1] - center[1], 2.0))
-        if d > rad:
-            rad = d
-
+    """Return the [x,y] center and radius (max xy-distance) of the cylinder."""
+    center = crd[:, :2].mean(axis=0)
+    rad = float(np.max(np.sqrt(np.sum((crd[:, :2] - center) ** 2, axis=1))))
     return center, rad
 
 
@@ -373,7 +346,7 @@ def select_ndx(fname="index.ndx", message=False):
         sys.stdout.write('%d %s: %d atoms\n' % (i, name, len(groups[name])))
     sys.stdout.write('\n')
 
-    if message == False:
+    if not message:
         sys.stdout.write('Select a group for analysis:\n')
     else:
         sys.stdout.write(message + '\n')
@@ -381,7 +354,7 @@ def select_ndx(fname="index.ndx", message=False):
     ndxNum = -1
     while ndxNum == -1:
         ndxNum = input()
-        if ndxNum.isdigit() == False:
+        if not ndxNum.isdigit():
             sys.stdout.write('Wrong index group number selected (use an integer number)\n')
             ndxNum = -1
             continue
@@ -513,7 +486,6 @@ def plot_ion_positions(ion_zpos, ion_resname, trjTimes, plows, pmids, phighs,
         ax.set_xlabel('Time (ns)')
         ax.set_ylabel('Z position (Å)')
         ax.set_title('%s ions  (n=%d,  %d permeating)' % (resname, len(ion_keys), len(perm_keys)))
-        #ax.legend(loc='upper right', fontsize=7, ncol=max(1, len(perm_keys) // 10 + 1))
         ax.grid(True, alpha=0.2)
 
     plt.tight_layout()
@@ -1551,6 +1523,174 @@ def plot_coordination(coord_data, ion_resname, plows, pmids, phighs,
         print('Saved: %s' % xvg_path)
 
 
+def analyze_pore_occupancy(ionsCyl, ion_zpos, ion_xpos, ion_ypos,
+                           ion_resname, trjTimes, plows, phighs,
+                           cyl_zlows, cyl_zhighs, outbase):
+    """Analyze ion occupancy of the pore cylinder vs time.
+
+    Only ions that are inside the cylinder AND within the effective z-range
+    are counted.  The effective z-range per frame is the intersection of the
+    membrane boundaries (plow, phigh) and the cylinder group z-extent
+    (cyl_zlow, cyl_zhigh) — whichever is tighter.
+
+    Produces:
+      - <base>_<resname>_pore_occupancy.png  : occupancy time series + histogram
+      - <base>_<resname>_pore_occupancy.dat  : frame-by-frame occupancy data
+      - <base>_<resname>_ion_ion_distances.png : histogram of pairwise distances
+      - <base>_<resname>_ion_ion_distances.dat : raw distance data
+    """
+    from itertools import combinations
+
+    # --- determine number of frames and ion keys ---
+    keys = sorted(ionsCyl.keys())
+    n_frames = len(ionsCyl[keys[0]])
+    times = np.array(trjTimes[:n_frames])
+
+    # --- per-frame occupancy (cylinder + effective z-range) ---
+    occupancy = np.zeros(n_frames, dtype=int)
+    for fi in range(n_frames):
+        zlo = max(plows[fi], cyl_zlows[fi])
+        zhi = min(phighs[fi], cyl_zhighs[fi])
+        for k in keys:
+            if ionsCyl[k][fi] == 1:
+                z = ion_zpos[k][fi]
+                if zlo <= z <= zhi:
+                    occupancy[fi] += 1
+
+    # --- per-frame pairwise distances for frames with >= 2 ions ---
+    all_distances = []
+    for fi in range(n_frames):
+        zlo = max(plows[fi], cyl_zlows[fi])
+        zhi = min(phighs[fi], cyl_zhighs[fi])
+        # collect positions of ions inside cylinder AND effective z-range
+        in_cyl = []
+        for k in keys:
+            if ionsCyl[k][fi] == 1:
+                z = ion_zpos[k][fi]
+                if zlo <= z <= zhi:
+                    in_cyl.append((ion_xpos[k][fi], ion_ypos[k][fi], z))
+        if len(in_cyl) >= 2:
+            for (a, b) in combinations(range(len(in_cyl)), 2):
+                dx = in_cyl[a][0] - in_cyl[b][0]
+                dy = in_cyl[a][1] - in_cyl[b][1]
+                dz = in_cyl[a][2] - in_cyl[b][2]
+                all_distances.append(np.sqrt(dx*dx + dy*dy + dz*dz))
+
+    all_distances = np.array(all_distances)
+
+    # --- determine resname (use first ion key) ---
+    resname = ion_resname[keys[0]]
+
+    # ===== PLOT 1: occupancy time series + histogram =====
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4),
+                                    gridspec_kw={'width_ratios': [3, 1]})
+
+    ax1.plot(times, occupancy, linewidth=0.3, color='steelblue', alpha=0.7)
+    # running average for clarity
+    window = max(1, n_frames // 200)
+    if window > 1:
+        occ_smooth = np.convolve(occupancy, np.ones(window)/window, mode='same')
+        ax1.plot(times, occ_smooth, linewidth=1.5, color='darkblue',
+                 label='running avg (w=%d)' % window)
+        ax1.legend(fontsize=8)
+    ax1.set_xlabel('Time (ns)')
+    ax1.set_ylabel('Number of %s in pore' % resname)
+    ax1.set_title('Pore occupancy vs time')
+    ax1.set_ylim(bottom=-0.2)
+
+    # histogram
+    max_occ = int(occupancy.max())
+    bins_hist = np.arange(-0.5, max_occ + 1.5, 1)
+    counts, _ = np.histogram(occupancy, bins=bins_hist)
+    fractions = counts / n_frames
+    ax2.bar(range(max_occ + 1), fractions, color='steelblue', edgecolor='black')
+    ax2.set_xlabel('Number of %s in pore' % resname)
+    ax2.set_ylabel('Fraction of frames')
+    ax2.set_title('Occupancy distribution')
+    if max_occ <= 15:
+        ax2.set_xticks(range(max_occ + 1))
+    else:
+        step = max(1, (max_occ + 1) // 10)
+        ax2.set_xticks(range(0, max_occ + 1, step))
+
+    # annotate mean
+    mean_occ = occupancy.mean()
+    ax2.axvline(mean_occ, color='red', linestyle='--', linewidth=1.5)
+    ax2.text(mean_occ + 0.1, fractions.max() * 0.9, 'mean=%.2f' % mean_occ,
+             color='red', fontsize=9)
+
+    plt.tight_layout()
+    occ_png = '%s_%s_pore_occupancy.png' % (outbase, resname)
+    plt.savefig(occ_png, dpi=150)
+    plt.close()
+    print('Saved: %s' % occ_png)
+
+    # write occupancy dat file
+    occ_dat = '%s_%s_pore_occupancy.dat' % (outbase, resname)
+    with open(occ_dat, 'w') as f:
+        f.write('# Pore occupancy: number of %s ions inside cylinder per frame\n' % resname)
+        f.write('# z-range: max(plow, cyl_zmin) to min(phigh, cyl_zmax)\n')
+        f.write('# Mean effective z-range: %.1f - %.1f A\n'
+                % (np.mean([max(plows[i], cyl_zlows[i]) for i in range(n_frames)]),
+                   np.mean([min(phighs[i], cyl_zhighs[i]) for i in range(n_frames)])))
+        f.write('# Mean occupancy: %.4f\n' % mean_occ)
+        f.write('# Occupancy distribution (n_ions  fraction_of_frames):\n')
+        for n_ions in range(max_occ + 1):
+            f.write('#   %d  %.6f\n' % (n_ions, fractions[n_ions] if n_ions < len(fractions) else 0.0))
+        f.write('#\n')
+        f.write('# %10s  %6s\n' % ('time_ns', 'n_ions'))
+        for fi in range(n_frames):
+            f.write('%12.4f  %6d\n' % (times[fi], occupancy[fi]))
+    print('Saved: %s' % occ_dat)
+
+    # ===== PLOT 2: ion-ion distance histogram =====
+    if len(all_distances) > 0:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        bin_width = 0.5  # Angstroms
+        d_max = min(all_distances.max(), 50.0)  # cap at 50 A for clarity
+        bins_d = np.arange(0, d_max + bin_width, bin_width)
+        ax.hist(all_distances[all_distances <= d_max], bins=bins_d,
+                color='coral', edgecolor='black', linewidth=0.3, density=True)
+        ax.set_xlabel('Pairwise ion-ion distance (A)')
+        ax.set_ylabel('Probability density')
+        ax.set_title('Ion-ion distances inside pore (%s, %d pairs from %d frames with >= 2 ions)'
+                      % (resname, len(all_distances),
+                         int(np.sum(occupancy >= 2))))
+        # annotate median
+        median_d = np.median(all_distances)
+        ax.axvline(median_d, color='red', linestyle='--', linewidth=1.5)
+        ax.text(median_d + 0.3, ax.get_ylim()[1] * 0.9,
+                'median=%.1f A' % median_d, color='red', fontsize=9)
+        plt.tight_layout()
+        dist_png = '%s_%s_ion_ion_distances.png' % (outbase, resname)
+        plt.savefig(dist_png, dpi=150)
+        plt.close()
+        print('Saved: %s' % dist_png)
+
+        # write distance dat file
+        dist_dat = '%s_%s_ion_ion_distances.dat' % (outbase, resname)
+        with open(dist_dat, 'w') as f:
+            f.write('# Pairwise ion-ion distances (A) for %s ions inside the pore cylinder\n' % resname)
+            f.write('# Total pairs: %d  (from %d frames with >= 2 ions)\n'
+                    % (len(all_distances), int(np.sum(occupancy >= 2))))
+            f.write('# Median distance: %.4f A\n' % median_d)
+            f.write('# Mean distance: %.4f A\n' % np.mean(all_distances))
+            f.write('#\n')
+            # write histogram
+            counts_d, edges_d = np.histogram(all_distances, bins=np.arange(0, all_distances.max() + bin_width, bin_width))
+            f.write('# Histogram (bin_center_A  count  probability_density)\n')
+            total = float(len(all_distances))
+            for i in range(len(counts_d)):
+                center = (edges_d[i] + edges_d[i+1]) / 2.0
+                density = counts_d[i] / (total * bin_width) if total > 0 else 0.0
+                f.write('%10.4f  %8d  %12.6f\n' % (center, counts_d[i], density))
+        print('Saved: %s' % dist_dat)
+    else:
+        print('No frames with >= 2 ions in pore — skipping ion-ion distance analysis')
+
+    return occupancy, all_distances
+
+
 def main(argv):
 
     ################################
@@ -1613,7 +1753,7 @@ def main(argv):
     ndxCyl = []
     (ndxPhos, ndxPhosNum) = select_ndx(ndxFile, message='Select phosphate group\n')
     (ndxIons, ndxIonsNum) = select_ndx(ndxFile, message='Select ion group\n')
-    if bCyl == True:
+    if bCyl:
         (ndxCyl, ndxCylNum) = select_ndx(ndxFile, message='Select protein group for cylinder\n')
     ionNum = len(ndxIons)
 
@@ -1637,15 +1777,14 @@ def main(argv):
     #### reading trajectory ####
     frnum = 0
     trjTimes = []
-    plow = 0.0
-    pmid = 0.0
-    phigh = 0.0
     plows = []
     pmids = []
     phighs = []
     box_xs = []
     box_ys = []
     box_zs = []
+    cyl_zlows = []
+    cyl_zhighs = []
 
     for ts in u.trajectory:
         # u.atoms.positions is shape (N, 3) in Angstroms
@@ -1657,9 +1796,11 @@ def main(argv):
         plows.append(plow)
         pmids.append(pmid)
         phighs.append(phigh)
-        if bCyl == True:
+        if bCyl:
             cylCrd = positions[ndxCyl]
             cylCenter, cylRad = get_cylinder(cylCrd)
+            cyl_zlows.append(float(cylCrd[:, 2].min()))
+            cyl_zhighs.append(float(cylCrd[:, 2].max()))
 
         # analyze ions
         for i in range(ionNum):
@@ -1674,8 +1815,8 @@ def main(argv):
             ion_ypos[ndxIons[i]].append(y)
             ion_zpos[ndxIons[i]].append(z)
             # track if in cylinder
-            if bCyl == True:
-                c = identify_if_in_cylinder(x, y, cylCenter, cylRad)
+            if bCyl:
+                c = identify_if_in_cylinder(x, y, cylCenter, cylRad * cylRad)
                 ionsCyl[ndxIons[i]].append(c)
 
         # store trj time (converted ps -> ns) and box dimensions
@@ -1705,85 +1846,70 @@ def main(argv):
     ###################### output ########################
     ######################################################
     ######################################################
-    fp = open(predFile, 'w')
-    # summary
-    fp.write('-----------------------------------\n')
-    fp.write('-----------------------------------\n')
-    fp.write('Total simulation time: {0} ns\n'.format(trjTimes[-1]))
-    fp.write('Total permeations up: {0}\n'.format(totalUp))
-    fp.write('Total permeations down: {0}\n'.format(totalDown))
-    fp.write('-----------------------------------\n')
-    currentUp = totalUp * 1.602176634 / trjTimes[-1] * 100.0  # pA
-    currentDown = totalDown * 1.602176634 / trjTimes[-1] * 100.0  # pA
-    fp.write('Current up: {0} pA\n'.format(round(currentUp, 5)))
-    fp.write('Current down: {0} pA\n'.format(round(currentDown, 5)))
-    fp.write('-----------------------------------\n')
-    fp.write('-----------------------------------\n')
+    with open(predFile, 'w') as fp:
+        # summary
+        fp.write('-----------------------------------\n')
+        fp.write('-----------------------------------\n')
+        fp.write('Total simulation time: {0} ns\n'.format(trjTimes[-1]))
+        fp.write('Total permeations up: {0}\n'.format(totalUp))
+        fp.write('Total permeations down: {0}\n'.format(totalDown))
+        fp.write('-----------------------------------\n')
+        currentUp = totalUp * 1.602176634 / trjTimes[-1] * 100.0  # pA
+        currentDown = totalDown * 1.602176634 / trjTimes[-1] * 100.0  # pA
+        fp.write('Current up: {0} pA\n'.format(round(currentUp, 5)))
+        fp.write('Current down: {0} pA\n'.format(round(currentDown, 5)))
+        fp.write('-----------------------------------\n')
+        fp.write('-----------------------------------\n')
 
-    #########################
-    ##### cylinder ##########
-    #########################
-    if bCyl == True:
-        fp.write('\n**************************\n')
-        fp.write('******** Cylinder ********\n')
-        fp.write('Cylinder permeations up: {0}\n'.format(CYLtotalUp))
-        fp.write('Cylinder permeations down: {0}\n'.format(CYLtotalDown))
-        fp.write('---------\n')
-        currentUp = CYLtotalUp * 1.602176634 / trjTimes[-1] * 100.0  # pA
-        currentDown = CYLtotalDown * 1.602176634 / trjTimes[-1] * 100.0  # pA
-        fp.write('Cylinder current up: {0} pA\n'.format(round(currentUp, 5)))
-        fp.write('Cylinder current down: {0} pA\n'.format(round(currentDown, 5)))
-        fp.write('******** Cylinder ********\n')
-        fp.write('**************************\n\n')
+        if bCyl:
+            fp.write('\n**************************\n')
+            fp.write('******** Cylinder ********\n')
+            fp.write('Cylinder permeations up: {0}\n'.format(CYLtotalUp))
+            fp.write('Cylinder permeations down: {0}\n'.format(CYLtotalDown))
+            fp.write('---------\n')
+            currentUp = CYLtotalUp * 1.602176634 / trjTimes[-1] * 100.0  # pA
+            currentDown = CYLtotalDown * 1.602176634 / trjTimes[-1] * 100.0  # pA
+            fp.write('Cylinder current up: {0} pA\n'.format(round(currentUp, 5)))
+            fp.write('Cylinder current down: {0} pA\n'.format(round(currentDown, 5)))
+            fp.write('******** Cylinder ********\n')
+            fp.write('**************************\n\n')
 
-    fp.write('-----------\n')
-    fp.write('--Details--\n')
-    fp.write('-----------\n')
-    if totalUp > 0:
-        for key in transitionsUp.keys():
-            if transitionsUp[key] > 0:
-                fp.write('Up: ion {0} had {1} permeations at times (ns):'.format(key, transitionsUp[key]))
-                for i in range(transitionsUp[key]):
-                    fp.write(' {0}'.format(transitionsUpTimes[key][i]))
-                fp.write('\n')
-                fp.write('Up: ion {0} transit times (ns):'.format(key))
-                for i in range(len(transitionsUpTransit[key])):
-                    fp.write(' {0}'.format(round(transitionsUpTransit[key][i], 1)))
-                fp.write('\n')
-    if totalDown > 0:
-        for key in transitionsDown.keys():
-            if transitionsDown[key] > 0:
-                fp.write('Down: ion {0} had {1} permeations at times (ns):'.format(key, transitionsDown[key]))
-                for i in range(transitionsDown[key]):
-                    fp.write(' {0}'.format(transitionsDownTimes[key][i]))
-                fp.write('\n')
-                fp.write('Down: ion {0} transit times (ns):'.format(key))
-                for i in range(len(transitionsDownTransit[key])):
-                    fp.write(' {0}'.format(round(transitionsDownTransit[key][i], 1)))
-                fp.write('\n')
+        fp.write('-----------\n')
+        fp.write('--Details--\n')
+        fp.write('-----------\n')
+        for direction, trans, trans_times, trans_transit, total, prefix in [
+            ('Up',   transitionsUp,   transitionsUpTimes,   transitionsUpTransit,   totalUp,   'Up'),
+            ('Down', transitionsDown, transitionsDownTimes, transitionsDownTransit, totalDown, 'Down'),
+        ]:
+            if total > 0:
+                for key in trans:
+                    if trans[key] > 0:
+                        fp.write('{0}: ion {1} had {2} permeations at times (ns):'.format(
+                            prefix, key, trans[key]))
+                        for t in trans_times[key]:
+                            fp.write(' {0}'.format(t))
+                        fp.write('\n')
+                        fp.write('{0}: ion {1} transit times (ns):'.format(prefix, key))
+                        for tt in trans_transit[key]:
+                            fp.write(' {0}'.format(round(tt, 1)))
+                        fp.write('\n')
 
-    #########################
-    ##### cylinder ##########
-    #########################
-    if bCyl == True:
-        fp.write('\n***********\n')
-        fp.write('**Details**\n')
-        fp.write('***********\n')
-        if CYLtotalUp > 0:
-            for key in CYLtransitionsUp.keys():
-                if CYLtransitionsUp[key] > 0:
-                    fp.write('Cylinder up: ion {0} had {1} permeations at times (ns):'.format(key, CYLtransitionsUp[key]))
-                    for i in range(CYLtransitionsUp[key]):
-                        fp.write(' {0}'.format(CYLtransitionsUpTimes[key][i]))
-                    fp.write('\n')
-        if CYLtotalDown > 0:
-            for key in CYLtransitionsDown.keys():
-                if CYLtransitionsDown[key] > 0:
-                    fp.write('Cylinder down: ion {0} had {1} permeations at times (ns):'.format(key, CYLtransitionsDown[key]))
-                    for i in range(CYLtransitionsDown[key]):
-                        fp.write(' {0}'.format(CYLtransitionsDownTimes[key][i]))
-                    fp.write('\n')
-    fp.close()
+        if bCyl:
+            fp.write('\n***********\n')
+            fp.write('**Details**\n')
+            fp.write('***********\n')
+            for direction, trans, trans_times, total, prefix in [
+                ('Up',   CYLtransitionsUp,   CYLtransitionsUpTimes,   CYLtotalUp,   'Cylinder up'),
+                ('Down', CYLtransitionsDown, CYLtransitionsDownTimes, CYLtotalDown, 'Cylinder down'),
+            ]:
+                if total > 0:
+                    for key in trans:
+                        if trans[key] > 0:
+                            fp.write('{0}: ion {1} had {2} permeations at times (ns):'.format(
+                                prefix, key, trans[key]))
+                            for t in trans_times[key]:
+                                fp.write(' {0}'.format(t))
+                            fp.write('\n')
 
     ######################################################
     ###################### plots ########################
@@ -1797,6 +1923,9 @@ def main(argv):
     if bCyl:
         plot_density_pmf_pore(ion_zpos, ionsCyl, ion_resname, plows, pmids, phighs,
                               mean_box_z, outbase, u=u, ndxCyl=ndxCyl)
+        analyze_pore_occupancy(ionsCyl, ion_zpos, ion_xpos, ion_ypos,
+                               ion_resname, trjTimes, plows, phighs,
+                               cyl_zlows, cyl_zhighs, outbase)
     plot_density_pmf_2d(ion_xpos, ion_ypos, ion_zpos, ion_resname,
                         mean_box_x, mean_box_y, mean_box_z,
                         plows, phighs, outbase)
