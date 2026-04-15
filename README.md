@@ -1,6 +1,6 @@
-# ion permeation counter
+# ion permeation analyzer
 
-Ion permeation counter and density / PMF analysis tool for GROMACS molecular
+Ion permeation analyzer and density / PMF analysis tool for GROMACS molecular
 dynamics trajectories. Built on [MDAnalysis](https://www.mdanalysis.org/).
 
 The tool counts how many times each ion of a chosen species crosses a lipid
@@ -64,7 +64,7 @@ pip install MDAnalysis numpy scipy matplotlib
 ## Usage
 
 ```bash
-python ion-permeation-counter.py -s <structure> -f <trajectory> -n <index> -o <output> [-cyl] [-coord]
+python ion-permeation-analyzer.py -s <structure> -f <trajectory> -n <index> -o <output> [-cyl] [-coord]
 ```
 
 | Argument | Description |
@@ -92,7 +92,7 @@ preserved:
 
 ```bash
 conda run -n mdanalysis bash -c \
-  "printf '19\n13\n1\n' | python ion-permeation-counter.py \
+  "printf '19\n13\n1\n' | python ion-permeation-analyzer.py \
      -s md.pdb -f md.xtc -n index.ndx -o out.dat -cyl"
 ```
 
@@ -400,7 +400,7 @@ flag and not run by default.
 
 ```bash
 conda activate mdanalysis
-python ion-permeation-counter.py \
+python ion-permeation-analyzer.py \
     -s structure.gro \
     -f trajectory.xtc \
     -n index.ndx \
@@ -424,7 +424,7 @@ out_K_density_pmf_YZ.png / .dat  # 2D YZ density + PMF
 ### With cylinder (recommended for channels with a protein pore)
 
 ```bash
-python ion-permeation-counter.py \
+python ion-permeation-analyzer.py \
     -s channel.pdb -f channel.xtc -n index.ndx -o out.dat -cyl
 # select phosphate group, ion group, then protein group
 ```
@@ -441,7 +441,7 @@ out_POT_ion_ion_distances.png / .dat   # pairwise ion-ion distance histogram
 ### With coordination analysis
 
 ```bash
-python ion-permeation-counter.py \
+python ion-permeation-analyzer.py \
     -s channel.pdb -f channel.xtc -n index.ndx -o out.dat -cyl -coord
 # select phosphate group, ion group, then protein group
 ```
