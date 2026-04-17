@@ -1,0 +1,6 @@
+*.DS_Store
+*/
+
+!.gitignore
+!ion-permeation-analyzer.py
+!README.md
