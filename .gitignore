@@ -1,5 +1,7 @@
 *.DS_Store
 */
+CLAUDE.md
+notes
 
 !.gitignore
 !ion-permeation-analyzer.py
