@@ -3,6 +3,8 @@ __doc__ = """
 ion-permeation-analyzer.py  —  Ion permeation analyzer for GROMACS MD trajectories
 =================================================================================
 
+by Vytautas Gapsys and Wojciech Kopec
+
 Usage
 -----
     python ion-permeation-analyzer.py -s <structure> -f <trajectory> -n <index> -o <output> [-cyl] [-coord]

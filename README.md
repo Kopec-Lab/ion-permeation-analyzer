@@ -7,7 +7,7 @@ The tool counts how many times each ion of a chosen species crosses a lipid
 bilayer (or any membrane defined by a phosphate-like reference group), and
 produces ready-to-use plots and numerical output for the permeation events,
 ion z-trajectories, 1D / 2D density and PMF profiles, and automatic
-binding-site detection from the free energy landscape. Based on the earlier code written by Vytautas Gapsys.
+binding-site detection from the free energy landscape. Core idea and first implementation by Vytautas Gapsys, further modification by WK.
 
 ## What it does
 
